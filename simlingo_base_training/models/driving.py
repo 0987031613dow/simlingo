@@ -61,6 +61,10 @@ class DrivingModel(pl.LightningModule):
         token_pruning_loss_weight: float = 0.1,
         token_pruning_num_heads: int = 8,
         token_pruning_decoder_layers: int = 2,
+        # When True, freeze all parameters except token_pruner and only
+        # optimise the pruner.  Load an existing checkpoint via `weights=`
+        # to keep the backbone frozen at its pretrained values.
+        pruner_only_training: bool = False,
     ):
         super().__init__()
 
@@ -132,6 +136,15 @@ class DrivingModel(pl.LightningModule):
                 num_pruner_heads=token_pruning_num_heads,
                 num_decoder_layers=token_pruning_decoder_layers,
             )
+
+        # Freeze backbone when training only the pruner
+        if pruner_only_training:
+            assert self.token_pruner is not None, (
+                "pruner_only_training=True requires token_pruning_ratio > 0"
+            )
+            for name, param in self.named_parameters():
+                if not name.startswith("token_pruner."):
+                    param.requires_grad_(False)
 
         self.tok = self.language_model.tokenizer
         self.bos_token_id = self.tok.bos_token_id
@@ -328,14 +341,20 @@ class DrivingModel(pl.LightningModule):
 
     def configure_optimizers(self):
 
-        param_groups = [
-            ParamGroup(r"^(model|language_model|language_projection|adaptors|speed_encoder|route_encoder|token_pruner)\..*", self.lr, self.weight_decay),
-            ParamGroup(r"^vision_model\..*", self.vision_lr, self.weight_decay),
-        ]
         optimizer_class = (
             FusedAdam if isinstance(self.trainer.strategy, pl.strategies.DeepSpeedStrategy) else torch.optim.AdamW
         )
-        optimizer = optimizer_class(configure_params_groups(self, param_groups, verbose=False), betas=self.betas)
+
+        if self.hparams.pruner_only_training:
+            # Only optimise the token pruner; everything else is frozen.
+            pruner_params = [p for p in self.token_pruner.parameters() if p.requires_grad]
+            optimizer = optimizer_class(pruner_params, lr=self.lr, weight_decay=self.weight_decay, betas=self.betas)
+        else:
+            param_groups = [
+                ParamGroup(r"^(model|language_model|language_projection|adaptors|speed_encoder|route_encoder|token_pruner)\..*", self.lr, self.weight_decay),
+                ParamGroup(r"^vision_model\..*", self.vision_lr, self.weight_decay),
+            ]
+            optimizer = optimizer_class(configure_params_groups(self, param_groups, verbose=False), betas=self.betas)
         lrs = [pg['lr'] for pg in optimizer.param_groups]
         if self.trainer.max_steps == -1:
             max_steps = self.trainer.estimated_stepping_batches

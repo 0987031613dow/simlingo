@@ -54,6 +54,9 @@ class DrivingModelConfig:
     token_pruning_loss_weight: float = 0.1
     token_pruning_num_heads: int = 8
     token_pruning_decoder_layers: int = 2
+    # Freeze backbone and only train the pruner (load pretrained weights via
+    # TrainConfig.weights before calling train)
+    pruner_only_training: bool = False
 
     _target_: str = "simlingo_base_training.models.driving.DrivingModel"
 

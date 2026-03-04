@@ -1,0 +1,55 @@
+# @package _global_
+#
+# Train only the ReconPruner on top of a frozen SimLingo backbone.
+#
+# Usage:
+#   python train.py +experiment=train_reconpruner weights=<path/to/simlingo.ckpt>
+#
+# The 'weights' key loads backbone weights without restoring the optimizer,
+# so training starts fresh for the pruner parameters only.
+#
+defaults:
+  - /data_module: carla_bucket_v12
+  - /model/vision_model: llavanext
+
+model:
+  lr: 1e-4
+  vision_lr: 1e-4                   # ignored – vision_model is frozen
+  predict_route_as_wps: True
+  speed_wps_mode: '2d'
+  language_model:
+    variant: tiny
+    lora: False
+    _target_: simlingo_base_training.models.language_model.llama.Llama
+  vision_model:
+    downsample_feature_grid_factor: 2
+
+  # --- ReconPruner settings ---
+  token_pruning_ratio: 0.5          # keep 50 % of visual tokens
+  token_pruning_loss_weight: 0.1    # weight of reconstruction loss
+  token_pruning_num_heads: 8
+  token_pruning_decoder_layers: 2
+  pruner_only_training: True        # freeze backbone, train pruner only
+
+data_module:
+  data_path: database/simlingo
+  bucket_path: database/bucketsv2_simlingo
+  batch_size: 28
+  num_workers: 10
+  route_as: target_point
+  hist_len: 1
+  cut_bottom_quarter: False
+  use_global_img: False
+  img_shift_augmentation: True
+  img_shift_augmentation_prob: 0.5
+  image_enhancing: True
+
+max_epochs: 5                       # pruner converges quickly
+seed: 42
+gpus: 8
+val_every_n_epochs: 1
+name: reconpruner_p50
+
+hydra:
+  run:
+    dir: outputs/${wandb_name}_${name}
