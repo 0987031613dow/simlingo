@@ -2,6 +2,7 @@ import datetime
 import json
 import os
 import random
+import time
 from pathlib import Path
 from pprint import PrettyPrinter
 from typing import Dict, Optional, Tuple, List
@@ -116,6 +117,9 @@ class DrivingModel(pl.LightningModule):
             driving_input = example
         
         if driving_input is not None:
+            # --- Vision Encoder ---
+            torch.cuda.synchronize()
+            _t_vis0 = time.perf_counter()
             adaptor_dict = self.adaptors(example, inference=True)
             adaptor_dict = self.vision_model.image_encoder.replace_placeholder_tokens(
                     adaptor_dict = adaptor_dict,
@@ -123,7 +127,10 @@ class DrivingModel(pl.LightningModule):
                     placeholder_values = driving_input.prompt_inference.placeholder_values,
                     wp_encoder = self.wp_encoder,
                 )
-            
+            torch.cuda.synchronize()
+            _t_vis1 = time.perf_counter()
+            self._timing_vision_ms = round((_t_vis1 - _t_vis0) * 1000, 1)
+
             input_embeds_all = adaptor_dict["language_inputs"]
             attention_masks = adaptor_dict['language_inputs_mask']
 
@@ -140,7 +147,9 @@ class DrivingModel(pl.LightningModule):
                 else:
                     eos = self.tokenizer.eos_token_id
 
-                # BUG: input_embeds, cot
+                # --- LLM (greedy language generation) ---
+                torch.cuda.synchronize()
+                _t_llm0 = time.perf_counter()
                 sampled_tokens, input_embeds = self.language_model.greedy_sample(
                     input_embed,
                     eos_token_id=eos,
@@ -150,7 +159,10 @@ class DrivingModel(pl.LightningModule):
                     attention_mask=attention_mask,
                     # position_ids=position_ids,
                 )
-                
+                torch.cuda.synchronize()
+                _t_llm1 = time.perf_counter()
+                self._timing_llm_ms = round((_t_llm1 - _t_llm0) * 1000, 1)
+
                 inputs_driving = self.adaptors.driving(driving_input)
                 input_embed_concat = torch.cat((input_embeds, inputs_driving["inputs"][b_idx].unsqueeze(0)), dim=1)
                 features, logits = self.language_model.forward(input_embed_concat)
@@ -159,7 +171,14 @@ class DrivingModel(pl.LightningModule):
 
                 driving_features = features[:, -len_driving:]
                 driving_logits = logits[:, -len_driving:]
+
+                # --- Waypoint Decoder ---
+                torch.cuda.synchronize()
+                _t_dec0 = time.perf_counter()
                 predictions = self.adaptors.driving.get_predictions(driving_features, driving_logits)
+                torch.cuda.synchronize()
+                _t_dec1 = time.perf_counter()
+                self._timing_decoder_ms = round((_t_dec1 - _t_dec0) * 1000, 1)
                     
                 for k, v in predictions.items():
                     if v is not None:
@@ -178,7 +197,13 @@ class DrivingModel(pl.LightningModule):
             # single forward pass same as during training so we can use the same function
             features = self.forward_model(driving_input, adaptor_dict)
             outputs_by_adaptor = self.adaptors.split_outputs_by_adaptor(adaptor_dict, features)
+            # --- Waypoint Decoder ---
+            torch.cuda.synchronize()
+            _t_dec0 = time.perf_counter()
             predictions = self.adaptors.driving.get_predictions(outputs_by_adaptor['driving'])
+            torch.cuda.synchronize()
+            _t_dec1 = time.perf_counter()
+            self._timing_decoder_ms = round((_t_dec1 - _t_dec0) * 1000, 1)
 
             for k, v in predictions.items():
                 if v is not None:
@@ -197,12 +222,18 @@ class DrivingModel(pl.LightningModule):
         Forward model conditioned on the given driving input.
         """
         
+        # --- Vision Encoder ---
+        torch.cuda.synchronize()
+        _t0 = time.perf_counter()
         adaptor_dict = self.vision_model.image_encoder.replace_placeholder_tokens(
             adaptor_dict = adaptor_dict,
             pixel_values = driving_input.camera_images,
             placeholder_values = driving_input.prompt.placeholder_values,
             wp_encoder = self.wp_encoder,
         )
+        torch.cuda.synchronize()
+        _t1 = time.perf_counter()
+        self._timing_vision_ms = round((_t1 - _t0) * 1000, 1)
 
         position_ids = None
         adaptor_embeds = adaptor_dict["inputs"]
@@ -214,6 +245,9 @@ class DrivingModel(pl.LightningModule):
         )
         attention_mask = adaptor_mask
 
+        # --- LLM ---
+        torch.cuda.synchronize()
+        _t_llm0 = time.perf_counter()
         outputs = self.language_model.model(
             attention_mask=attention_mask,
             position_ids=position_ids,
@@ -221,6 +255,10 @@ class DrivingModel(pl.LightningModule):
             output_hidden_states=True,
             return_dict=True,
         )
+        torch.cuda.synchronize()
+        _t_llm1 = time.perf_counter()
+        self._timing_llm_ms = round((_t_llm1 - _t_llm0) * 1000, 1)
+
         features = outputs.hidden_states[-1]
         logits = outputs[0]
 
