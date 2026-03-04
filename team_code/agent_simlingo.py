@@ -58,15 +58,21 @@ def get_entry_point():
     return 'LingoAgent'
 
 
-DEBUG = False # saves images during evaluation
-HD_VIZ = False
+DEBUG = os.environ.get('SAVE_VIDEO', '0') == '1'  # saves images during evaluation (set SAVE_VIDEO=1 to enable)
+HD_VIZ = os.environ.get('HD_VIZ', '0') == '1'  # use high-res camera for visualization
 USE_UKF = True
 
 class LingoAgent(autonomous_agent.AutonomousAgent):
     """
         Main class that runs the agents with the run_step function
         """
-
+    def get_metric_info(self, steer=None, throttle=None, brake=None, speed=None):
+        return {
+            'steer':    round(float(steer),    4) if steer    is not None else None,
+            'throttle': round(float(throttle), 4) if throttle is not None else None,
+            'brake':    round(float(brake),    4) if brake    is not None else None,
+            'speed':    round(float(speed),    4) if speed    is not None else None,
+        }
     def setup(self, path_to_conf_file, route_index=None):
         """Sets up the agent. route_index is for logging purposes"""
 
@@ -88,6 +94,8 @@ class LingoAgent(autonomous_agent.AutonomousAgent):
         self.device = torch.device('cuda')
         self.DrivingInput = {}
         self.config = GlobalConfig()
+        self._last_step_end = None   # for CARLA round-trip measurement
+        self.timing_log = {}         # per-step timing log
 
         if self.config.eval_route_as == -1:
             self.config.eval_route_as = self.model.route_as
@@ -668,20 +676,29 @@ class LingoAgent(autonomous_agent.AutonomousAgent):
     @torch.no_grad()
     def run_step(self, input_data, timestamp, sensors=None):  # pylint: disable=locally-disabled, unused-argument
         self.step += 1
+        t_run_start = time.perf_counter()
+        # CARLA round-trip = time from returning last control to receiving next sensor frame
+        carla_roundtrip_ms = round((t_run_start - self._last_step_end) * 1000, 1) if self._last_step_end else 0.0
 
         if not self.initialized:
             self._init()
             control = carla.VehicleControl(steer=0.0, throttle=0.0, brake=1.0)
             self.control = control
             tick_data = self.tick(input_data)
+            self._last_step_end = time.perf_counter()
             return control
 
-        # Need to run this every step for GPS filtering
+        # 1. Sensor preprocessing + prompt building
+        t_tick_start = time.perf_counter()
         tick_data = self.tick(input_data)
+        t_tick_end = time.perf_counter()
 
-        # initialize DrivingInput with dict self.DrivingInput
+        # 2. Full model forward pass (vision encoder + LLM + decoder)
         model_input = DrivingInput(**self.DrivingInput)
+        t_model_start = time.perf_counter()
         pred_speed_wps, pred_route, language = self.model(model_input)
+        torch.cuda.synchronize()
+        t_model_end = time.perf_counter()
         pred_speed_wps = pred_speed_wps.float() if pred_speed_wps is not None else None
         pred_route = pred_route.float() if pred_route is not None else None
 
@@ -762,7 +779,10 @@ class LingoAgent(autonomous_agent.AutonomousAgent):
             # save
             image.save(f"{self.save_path_img}/{self.step}.png")
             
+        # 3. PID waypoint → control signal
+        t_pid_start = time.perf_counter()
         steer, throttle, brake = self.control_pid(pred_route, gt_velocity, pred_speed_wps)
+        t_pid_end = time.perf_counter()
 
         # # 0.1 is just an arbitrary low number to threshold when the car is stopped
         if gt_velocity < 0.1:
@@ -789,13 +809,42 @@ class LingoAgent(autonomous_agent.AutonomousAgent):
         else:
             self.control = control
             
-        metric_info = self.get_metric_info()
+        t_run_end = time.perf_counter()
+        self._last_step_end = t_run_end
+
+        # Collect sub-model timings (populated by driving.py)
+        m = self.model
+        timing = {
+            'carla_roundtrip_ms': carla_roundtrip_ms,
+            'tick_preprocess_ms': round((t_tick_end - t_tick_start) * 1000, 1),
+            'model_total_ms':     round((t_model_end - t_model_start) * 1000, 1),
+            'vision_encoder_ms':  getattr(m, '_timing_vision_ms', None),
+            'lang_projection_ms': getattr(m, '_timing_projection_ms', None),
+            'route_enc_ms':       getattr(m, '_timing_route_enc_ms', None),
+            'llm_ms':             getattr(m, '_timing_llm_ms', None),
+            'decoder_ms':         getattr(m, '_timing_decoder_ms', None),
+            'pid_ms':             round((t_pid_end - t_pid_start) * 1000, 1),
+            'step_total_ms':      round((t_run_end - t_run_start) * 1000, 1),
+        }
+        self.timing_log[self.step] = timing
+        print(f"[TIMING step={self.step:4d}] "
+              f"carla_rt={timing['carla_roundtrip_ms']:6.1f}ms | "
+              f"preprocess={timing['tick_preprocess_ms']:6.1f}ms | "
+              f"vision={timing['vision_encoder_ms']}ms  proj={timing['lang_projection_ms']}ms  "
+              f"route_enc={timing['route_enc_ms']}ms  llm={timing['llm_ms']}ms  dec={timing['decoder_ms']}ms | "
+              f"pid={timing['pid_ms']:5.1f}ms | "
+              f"step_total={timing['step_total_ms']:6.1f}ms")
+
+        metric_info = self.get_metric_info(steer, throttle, brake, float(gt_velocity.cpu().numpy() if hasattr(gt_velocity, 'cpu') else gt_velocity))
         self.metric_info[self.step] = metric_info
         if self.save_path_metric is not None and self.step % 1 == 0:
                 # metric info
                 outfile = open(f"{self.save_path_metric}/metric_info.json", 'w')
                 json.dump(self.metric_info, outfile, indent=4)
                 outfile.close()
+                # timing log
+                with open(f"{self.save_path_metric}/timing_log.json", 'w') as f:
+                    json.dump(self.timing_log, f, indent=4)
 
         return control
 
@@ -864,7 +913,7 @@ class LingoAgent(autonomous_agent.AutonomousAgent):
 
         del self.model
         del self.config
-        if self.cfg.data_module.encoder == 'llavanext':
+        if self.cfg.data_module.get('encoder', None) == 'llavanext':
             del self.processor
 
 

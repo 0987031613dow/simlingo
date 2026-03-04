@@ -1,4 +1,5 @@
 import pickle as pkl
+import time
 from pprint import PrettyPrinter
 from typing import Optional, Tuple
 
@@ -135,7 +136,13 @@ class DrivingModel(pl.LightningModule):
         # single forward pass same as during training so we can use the same function
         inputs = self.adaptors(driving_input)
         features = self.forward_model(driving_input, inputs["inputs"])
+        # --- Waypoint Decoder ---
+        torch.cuda.synchronize()
+        _t_dec0 = time.perf_counter()
         predictions = self.adaptors.driving.get_predictions(features)
+        torch.cuda.synchronize()
+        _t_dec1 = time.perf_counter()
+        self._timing_decoder_ms = round((_t_dec1 - _t_dec0) * 1000, 1)
 
         for k, v in predictions.items():
             if v is not None:
@@ -162,9 +169,15 @@ class DrivingModel(pl.LightningModule):
             dtype=self.language_model.model.dtype
         )
 
+        # --- LLM ---
+        torch.cuda.synchronize()
+        _t_llm0 = time.perf_counter()
         outputs = self.language_model.forward(
             input_embeds,
         )
+        torch.cuda.synchronize()
+        _t_llm1 = time.perf_counter()
+        self._timing_llm_ms = round((_t_llm1 - _t_llm0) * 1000, 1)
 
         vision_outputs, adaptor_outputs = outputs.split(
             [outputs.size(1) - adaptor_embeds.size(1), adaptor_embeds.size(1)], dim=1
@@ -175,20 +188,33 @@ class DrivingModel(pl.LightningModule):
         img = driving_input.camera_images #[:, 0, :, :, :] # only use the front camera
         map_route = driving_input.map_route
 
+        # --- Vision Encoder ---
+        torch.cuda.synchronize()
+        _t0 = time.perf_counter()
         vision_embeds, _ = self.vision_model.forward(img, image_sizes=driving_input.image_sizes)
+        torch.cuda.synchronize()
+        _t1 = time.perf_counter()
+        self._timing_vision_ms = round((_t1 - _t0) * 1000, 1)
+
         attention_mask = None
 
-        # n_frames, n_tokens, channels = sizes
+        # --- Language Projection ---
         vision_embeds = self.language_projection(vision_embeds)
-        # channels = vision_embeds.size(2)
+        torch.cuda.synchronize()
+        _t2 = time.perf_counter()
+        self._timing_projection_ms = round((_t2 - _t1) * 1000, 1)
+
+        # --- Route / Speed Encoder ---
         BS = vision_embeds.size(0)
         route = self.route_encoder.forward(map_route)
         if self.speed_as_input:
             speed = self.speed_encoder.forward(driving_input.vehicle_speed)
-
             input_embeds = torch.cat((vision_embeds, speed, route), dim=1)
         else:
             input_embeds = torch.cat((vision_embeds, route), dim=1)
+        torch.cuda.synchronize()
+        _t3 = time.perf_counter()
+        self._timing_route_enc_ms = round((_t3 - _t2) * 1000, 1)
 
         return input_embeds, attention_mask
 
