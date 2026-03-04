@@ -48,6 +48,13 @@ class DrivingModelConfig:
     speed_as_input: bool = True
     new_layer_norm_minmax: bool = False
 
+    # Token pruning (ReconPruner, arxiv 2507.23318)
+    # Set token_pruning_ratio > 0 to enable (e.g. 0.5 = keep 50% of visual tokens)
+    token_pruning_ratio: float = 0.0
+    token_pruning_loss_weight: float = 0.1
+    token_pruning_num_heads: int = 8
+    token_pruning_decoder_layers: int = 2
+
     _target_: str = "simlingo_base_training.models.driving.DrivingModel"
 
 
