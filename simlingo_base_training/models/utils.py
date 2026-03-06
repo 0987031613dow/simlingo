@@ -39,9 +39,6 @@ def configure_params_groups(model: nn.Module, param_groups: Sequence[ParamGroup]
         "acceleration_head",
         "curvature_rate_head",
         "query_embeds",
-        # token pruner learnable embeddings
-        "saliency_query",
-        "mask_token",
     )
 
     decay_params = set()

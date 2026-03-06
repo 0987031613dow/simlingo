@@ -43,9 +43,14 @@ This repository is based on [Carla Garage](https://github.com/autonomousvision/c
     - [Dreamer Data](#dreamer-data)
 5. [Training](#training)
 6. [Evaluation](#evaluation)
-    - [Closed-loop driving/ Bench2Drive](#bench2drive)
+    - [Closed-loop driving / Bench2Drive](#bench2drive)
     - [Language eval](#language-eval)
-7. [Citations](#citations)
+    - [Debug Evaluation (Quick Test)](#debug-evaluation-quick-test)
+    - [Local Multi-GPU Batch Evaluation](#local-multi-gpu-batch-evaluation)
+    - [HPC / SLURM Batch Evaluation](#hpc--slurm-batch-evaluation)
+7. [Performance Profiling](#performance-profiling)
+8. [Monitoring Dashboard](#monitoring-dashboard)
+9. [Citations](#citations)
    
    
 ## Setup
@@ -221,6 +226,141 @@ NOTE: Files might get cleaned at some point in the future (maybe not, depending 
 Entry point for the language evaluation is [simlingo_training/eval.py](simlingo_training/eval.py). Please change the variable `eval_mode` to `QA`, `commentary` or `Dreaming`.
 Afterwards, to obtain the metrics you can run [simlingo_training/eval_metrics.py](simlingo_training/eval_metrics.py). For this you first need to specify an OpenAI key here: [simlingo_training/utils/gpt_eval.py](simlingo_training/utils/gpt_eval.py)
 
+
+### Debug Evaluation (Quick Test)
+
+Use `debug_eval_simlingo.sh` to quickly verify that the full pipeline works end-to-end before committing to a long evaluation run.
+
+```bash
+# Usage: bash debug_eval_simlingo.sh [GPU_ID] [NUM_ROUTES] [SAVE_VIDEO]
+
+# Run 2 routes on GPU 4 (no video)
+bash debug_eval_simlingo.sh 4 2 0
+
+# Run 4 routes on GPU 4, save frames for video
+bash debug_eval_simlingo.sh 4 4 1
+```
+
+Output is written to `eval_results/debug_<timestamp>/`.
+
+---
+
+### Local Multi-GPU Batch Evaluation
+
+Use `batch_eval_simlingo.sh` to run the full Bench2Drive 220-route benchmark locally across multiple GPUs in parallel.
+
+```bash
+# Usage
+bash batch_eval_simlingo.sh [options]
+
+# Options:
+#   --gpus "0 1 2 3"       GPU IDs to use (default: "4 5 6 7")
+#   --output /path/to/dir  Output directory (default: eval_results/batch_<timestamp>)
+#   --model /path/to.pt    Model checkpoint (default: outputs/simlingo/checkpoints/pytorch_model.pt)
+#   --routes /path/to/dir  Route XML directory (default: leaderboard/data/bench2drive_split)
+#   --save-video           Save per-frame images for video generation
+#   --generate-video       Auto-generate videos after eval (requires --save-video)
+#   --base-port 20000      Starting CARLA port (default: 20000)
+#   --port-step 200        Port gap between GPUs (default: 200)
+```
+
+**Examples:**
+
+```bash
+# Run all 220 routes on 8 GPUs
+bash batch_eval_simlingo.sh
+
+# Use 4 GPUs and generate result videos
+bash batch_eval_simlingo.sh --gpus "0 1 2 3" --save-video --generate-video
+
+# Custom output directory
+bash batch_eval_simlingo.sh --output eval_results/my_run
+```
+
+**Monitor progress:**
+```bash
+# Watch GPU 0 worker log in real time
+tail -f eval_results/batch_<timestamp>/logs/gpu0.log
+
+# Count completed routes
+ls eval_results/batch_<timestamp>/res/ | wc -l
+```
+
+Output structure:
+```
+eval_results/batch_<timestamp>/
+├── res/          # Per-route JSON results
+├── viz/          # Per-frame images (if --save-video)
+├── videos/       # Rendered MP4s (if --generate-video)
+└── logs/         # Per-GPU worker logs
+```
+
+> **Note:** Routes are distributed round-robin across GPUs. Each GPU runs its own CARLA instance on a dedicated port to avoid conflicts.
+
+---
+
+### HPC / SLURM Batch Evaluation
+
+Use `start_eval_simlingo_hpc.py` to submit evaluation jobs to a SLURM cluster. Each route is submitted as an independent SLURM job with automatic CARLA startup/shutdown.
+
+```bash
+# Edit the configs block at the top of the script to set your paths, then:
+python start_eval_simlingo_hpc.py
+```
+
+Key differences from the original `start_eval_simlingo.py`:
+- CARLA is started and stopped automatically inside each SLURM job (no pre-running CARLA needed)
+- Port conflict avoidance built-in
+- Supports `save_video: 1` in config to enable frame saving
+
+---
+
+## Performance Profiling
+
+The model and agent have built-in per-stage latency measurement. After each forward pass, the following timing attributes are populated:
+
+| Attribute | Where | Description |
+|---|---|---|
+| `model._timing_vision_ms` | `DrivingModel` | Vision encoder (ms) |
+| `model._timing_llm_ms` | `DrivingModel` | LLM forward pass (ms) |
+| `model._timing_decoder_ms` | `DrivingModel` | Waypoint decoder (ms) |
+| `agent.timing_log` | `LingoAgent` | Full per-step breakdown |
+
+All GPU timings use `torch.cuda.synchronize()` for accuracy.
+
+**Environment variable controls:**
+
+| Variable | Default | Effect |
+|---|---|---|
+| `SAVE_VIDEO=1` | off | Save per-frame images to disk during eval |
+| `HD_VIZ=1` | off | Use high-resolution camera for visualization |
+
+```bash
+# Example: run eval with video saving enabled
+SAVE_VIDEO=1 bash debug_eval_simlingo.sh 4 2 1
+```
+
+**Video generation** from saved frames:
+```bash
+python generate_eval_videos.py \
+    --input_dir  eval_results/<run>/viz \
+    --output_dir eval_results/<run>/videos \
+    --fps 10
+```
+
+---
+
+## Monitoring Dashboard
+
+`dashboard.py` provides a real-time monitoring view of evaluation results.
+
+```bash
+python dashboard.py
+```
+
+> Point `dashboard.py` at your `eval_results/` directory to track route completion, scores, and per-route status during a long evaluation run.
+
+---
 
 ## Citations
 If you find this repository useful, please consider giving us a star &#127775;.

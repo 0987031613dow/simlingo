@@ -7,6 +7,22 @@ eval/
 eval_results/
 pretrained/
 
+# Model weights (large binary files)
+weights/
+*.pt
+*.pth
+*.ckpt
+
+# Dataset symlinks / data directories
+b2d_data
+
+# Experiment results and logs
+simlingo_results.json
+*.json.bak
+
+# Hydra auto-generated configs
+.hydra/
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]

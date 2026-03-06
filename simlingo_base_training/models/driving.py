@@ -1,4 +1,5 @@
 import pickle as pkl
+import time
 from pprint import PrettyPrinter
 from typing import Optional, Tuple
 
@@ -11,7 +12,6 @@ from torchvision.models import ResNet18_Weights, resnet18
 from simlingo_base_training.models.adaptors.adaptors import (
     AdaptorList, DrivingAdaptor, VectorInputAdaptor, WaypointInputAdaptor
 )
-from simlingo_base_training.models.token_pruner import ReconPruner
 from simlingo_base_training.models.utils import configure_params_groups, summarise_losses
 from simlingo_base_training.utils.custom_types import (
     DrivingExample, DrivingInput, DrivingLabel, ParamGroup, TrainingOutput
@@ -56,15 +56,6 @@ class DrivingModel(pl.LightningModule):
         predict_route_as_wps=False,
         speed_wps_mode=False,
         variant=None,
-        # --- Token Pruning (ReconPruner) ---
-        token_pruning_ratio: float = 0.0,
-        token_pruning_loss_weight: float = 0.1,
-        token_pruning_num_heads: int = 8,
-        token_pruning_decoder_layers: int = 2,
-        # When True, freeze all parameters except token_pruner and only
-        # optimise the pruner.  Load an existing checkpoint via `weights=`
-        # to keep the backbone frozen at its pretrained values.
-        pruner_only_training: bool = False,
     ):
         super().__init__()
 
@@ -82,8 +73,6 @@ class DrivingModel(pl.LightningModule):
         self.new_layer_norm_minmax = new_layer_norm_minmax
         self.predict_route_as_wps = predict_route_as_wps
         self.speed_wps_mode = speed_wps_mode
-        self.token_pruning_ratio = token_pruning_ratio
-        self.token_pruning_loss_weight = token_pruning_loss_weight
 
         self.all_predictions = {}
         self.all_losses = {}
@@ -127,24 +116,6 @@ class DrivingModel(pl.LightningModule):
         if self.vision_model.token_size != self.language_model.hidden_size:
             self.language_projection = nn.Linear(self.vision_model.token_size, self.language_model.hidden_size, bias=False)
 
-        # Token pruner (disabled when pruning_ratio == 0)
-        self.token_pruner: Optional[ReconPruner] = None
-        if token_pruning_ratio > 0.0:
-            self.token_pruner = ReconPruner(
-                hidden_size=self.language_model.hidden_size,
-                pruning_ratio=token_pruning_ratio,
-                num_pruner_heads=token_pruning_num_heads,
-                num_decoder_layers=token_pruning_decoder_layers,
-            )
-
-        # Freeze backbone when training only the pruner
-        if pruner_only_training:
-            assert self.token_pruner is not None, (
-                "pruner_only_training=True requires token_pruning_ratio > 0"
-            )
-            for name, param in self.named_parameters():
-                if not name.startswith("token_pruner."):
-                    param.requires_grad_(False)
 
         self.tok = self.language_model.tokenizer
         self.bos_token_id = self.tok.bos_token_id
@@ -165,7 +136,13 @@ class DrivingModel(pl.LightningModule):
         # single forward pass same as during training so we can use the same function
         inputs = self.adaptors(driving_input)
         features = self.forward_model(driving_input, inputs["inputs"])
+        # --- Waypoint Decoder ---
+        torch.cuda.synchronize()
+        _t_dec0 = time.perf_counter()
         predictions = self.adaptors.driving.get_predictions(features)
+        torch.cuda.synchronize()
+        _t_dec1 = time.perf_counter()
+        self._timing_decoder_ms = round((_t_dec1 - _t_dec0) * 1000, 1)
 
         for k, v in predictions.items():
             if v is not None:
@@ -174,60 +151,60 @@ class DrivingModel(pl.LightningModule):
         return self.speed_wps, self.route
 
 
-    def forward_model(
-        self,
-        driving_input: DrivingInput,
-        adaptor_embeds: Tensor,
-        driving_labels: DrivingLabel = None,
-        return_pruning_loss: bool = False,
-    ) -> Tensor:
+    def forward_model(self, 
+                      driving_input: DrivingInput, 
+                      adaptor_embeds: Tensor, 
+                      driving_labels: DrivingLabel = None,
+                    #   language_embeds: Tensor = None
+                      ) -> Tensor:
         """
         Forward model conditioned on the given driving input.
         """
 
-        if return_pruning_loss:
-            vision_embeds, vision_attention_mask, pruning_loss = self.get_fixed_input_embeds(
-                driving_input, return_pruning_loss=True
-            )
-        else:
-            vision_embeds, vision_attention_mask = self.get_fixed_input_embeds(driving_input)
-            pruning_loss = None
+        vision_embeds, vision_attention_mask = self.get_fixed_input_embeds(driving_input)
 
         input_embeds = torch.cat((vision_embeds, adaptor_embeds), dim=1)
-        input_embeds = input_embeds.to(dtype=self.language_model.model.dtype)
+        # to dtype of language model
+        input_embeds = input_embeds.to(
+            dtype=self.language_model.model.dtype
+        )
 
-        outputs = self.language_model.forward(input_embeds)
+        # --- LLM ---
+        torch.cuda.synchronize()
+        _t_llm0 = time.perf_counter()
+        outputs = self.language_model.forward(
+            input_embeds,
+        )
+        torch.cuda.synchronize()
+        _t_llm1 = time.perf_counter()
+        self._timing_llm_ms = round((_t_llm1 - _t_llm0) * 1000, 1)
 
         vision_outputs, adaptor_outputs = outputs.split(
             [outputs.size(1) - adaptor_embeds.size(1), adaptor_embeds.size(1)], dim=1
         )
-        if return_pruning_loss:
-            return adaptor_outputs, pruning_loss
         return adaptor_outputs
     
-    def get_fixed_input_embeds(
-        self,
-        driving_input: DrivingInput,
-        return_pruning_loss: bool = False,
-    ):
-        img = driving_input.camera_images
+    def get_fixed_input_embeds(self, driving_input: DrivingInput):
+        img = driving_input.camera_images #[:, 0, :, :, :] # only use the front camera
         map_route = driving_input.map_route
 
+        # --- Vision Encoder ---
+        torch.cuda.synchronize()
+        _t0 = time.perf_counter()
         vision_embeds, _ = self.vision_model.forward(img, image_sizes=driving_input.image_sizes)
+        torch.cuda.synchronize()
+        _t1 = time.perf_counter()
+        self._timing_vision_ms = round((_t1 - _t0) * 1000, 1)
+
         attention_mask = None
 
+        # --- Language Projection ---
         vision_embeds = self.language_projection(vision_embeds)
+        torch.cuda.synchronize()
+        _t2 = time.perf_counter()
+        self._timing_projection_ms = round((_t2 - _t1) * 1000, 1)
 
-        # --- Token Pruning ---
-        pruning_loss = None
-        if self.token_pruner is not None:
-            if return_pruning_loss:
-                vision_embeds, pruning_loss = self.token_pruner(
-                    vision_embeds, training=True
-                )
-            else:
-                vision_embeds, _ = self.token_pruner(vision_embeds, training=False)
-
+        # --- Route / Speed Encoder ---
         BS = vision_embeds.size(0)
         route = self.route_encoder.forward(map_route)
         if self.speed_as_input:
@@ -235,9 +212,10 @@ class DrivingModel(pl.LightningModule):
             input_embeds = torch.cat((vision_embeds, speed, route), dim=1)
         else:
             input_embeds = torch.cat((vision_embeds, route), dim=1)
+        torch.cuda.synchronize()
+        _t3 = time.perf_counter()
+        self._timing_route_enc_ms = round((_t3 - _t2) * 1000, 1)
 
-        if return_pruning_loss:
-            return input_embeds, attention_mask, pruning_loss
         return input_embeds, attention_mask
 
     def forward_loss(self, example: DrivingExample, per_sample=False) -> TrainingOutput:
@@ -254,27 +232,8 @@ class DrivingModel(pl.LightningModule):
         adaptor_dict = self.adaptors(example)
         adaptor_embeds = adaptor_dict["inputs"]
 
-        use_pruning_loss = self.token_pruner is not None and self.token_pruning_loss_weight > 0.0
-        if use_pruning_loss:
-            adaptor_outputs, pruning_loss = self.forward_model(
-                example.driving_input, adaptor_embeds,
-                driving_labels=example.driving_label,
-                return_pruning_loss=True,
-            )
-        else:
-            adaptor_outputs = self.forward_model(
-                example.driving_input, adaptor_embeds,
-                driving_labels=example.driving_label,
-            )
-            pruning_loss = None
-
+        adaptor_outputs = self.forward_model(example.driving_input, adaptor_embeds, driving_labels=example.driving_label)
         loss_dict = self.adaptors.compute_loss(adaptor_outputs, adaptor_dict, example)
-
-        if pruning_loss is not None:
-            loss_dict["token_pruning_loss"] = (
-                pruning_loss * self.token_pruning_loss_weight,
-                torch.ones(1, device=pruning_loss.device),
-            )
 
         loss_dict_only_losses = {k:v for k, v in loss_dict.items() if k.endswith("loss")}
         pred_labels = {k:v for k, v in loss_dict.items() if not k.endswith("loss")}
@@ -341,20 +300,14 @@ class DrivingModel(pl.LightningModule):
 
     def configure_optimizers(self):
 
+        param_groups = [
+            ParamGroup(r"^(model|language_model|language_projection|adaptors|speed_encoder|route_encoder)\..*", self.lr, self.weight_decay),
+            ParamGroup(r"^vision_model\..*", self.vision_lr, self.weight_decay),
+        ]
         optimizer_class = (
             FusedAdam if isinstance(self.trainer.strategy, pl.strategies.DeepSpeedStrategy) else torch.optim.AdamW
         )
-
-        if self.hparams.pruner_only_training:
-            # Only optimise the token pruner; everything else is frozen.
-            pruner_params = [p for p in self.token_pruner.parameters() if p.requires_grad]
-            optimizer = optimizer_class(pruner_params, lr=self.lr, weight_decay=self.weight_decay, betas=self.betas)
-        else:
-            param_groups = [
-                ParamGroup(r"^(model|language_model|language_projection|adaptors|speed_encoder|route_encoder|token_pruner)\..*", self.lr, self.weight_decay),
-                ParamGroup(r"^vision_model\..*", self.vision_lr, self.weight_decay),
-            ]
-            optimizer = optimizer_class(configure_params_groups(self, param_groups, verbose=False), betas=self.betas)
+        optimizer = optimizer_class(configure_params_groups(self, param_groups, verbose=False), betas=self.betas)
         lrs = [pg['lr'] for pg in optimizer.param_groups]
         if self.trainer.max_steps == -1:
             max_steps = self.trainer.estimated_stepping_batches
