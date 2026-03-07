@@ -130,3 +130,46 @@ class AutonomousAgent(object):
         ds_ids = downsample_route(global_plan_world_coord, 200)
         self._global_plan_world_coord = [(global_plan_world_coord[x][0], global_plan_world_coord[x][1]) for x in ds_ids]
         self._global_plan = [global_plan_gps[x] for x in ds_ids]
+
+    def get_hero(self):
+        from srunner.scenariomanager.carla_data_provider import CarlaDataProvider
+        hero_actor = None
+        for actor in CarlaDataProvider.get_world().get_actors():
+            if 'role_name' in actor.attributes and actor.attributes['role_name'] == 'hero':
+                hero_actor = actor
+                break
+        self.hero_actor = hero_actor
+
+    def get_metric_info(self, steer=None, throttle=None, brake=None, speed=None):
+        """
+        Get metric info. Can be overridden by subclasses.
+        Default implementation returns vehicle telemetry.
+        """
+        # If specific control parameters are passed, return them (for LingoAgent compatibility)
+        if any(x is not None for x in [steer, throttle, brake, speed]):
+            return {
+                'steer':    round(float(steer),    4) if steer    is not None else None,
+                'throttle': round(float(throttle), 4) if throttle is not None else None,
+                'brake':    round(float(brake),    4) if brake    is not None else None,
+                'speed':    round(float(speed),    4) if speed    is not None else None,
+            }
+
+        # Default: return vehicle state from hero actor
+        self.get_hero()
+        if not hasattr(self, 'hero_actor') or self.hero_actor is None:
+            return {}
+
+        def vector2list(vector, rotation=False):
+            if rotation:
+                return [vector.roll, vector.pitch, vector.yaw]
+            else:
+                return [vector.x, vector.y, vector.z]
+
+        output = {}
+        output['acceleration'] = vector2list(self.hero_actor.get_acceleration())
+        output['angular_velocity'] = vector2list(self.hero_actor.get_angular_velocity())
+        output['forward_vector'] = vector2list(self.hero_actor.get_transform().get_forward_vector())
+        output['right_vector'] = vector2list(self.hero_actor.get_transform().get_right_vector())
+        output['location'] = vector2list(self.hero_actor.get_transform().location)
+        output['rotation'] = vector2list(self.hero_actor.get_transform().rotation, rotation=True)
+        return output

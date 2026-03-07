@@ -77,7 +77,7 @@ start_carla() {
     local log_suffix="${1:-}"
     echo "${LOG_PREFIX} 啟動 CARLA (off-screen, port=${PORT})..."
 
-    CUDA_VISIBLE_DEVICES="${GPU_ID}" \
+    VK_ICD_FILENAMES="/usr/share/vulkan/icd.d/nvidia_icd.json" \
     DISPLAY="${DISPLAY}" \
         "${CARLA_ROOT}/CarlaUE4.sh" \
         -RenderOffScreen \
